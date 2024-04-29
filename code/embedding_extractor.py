@@ -6,23 +6,17 @@ import time
 import glob
 import json
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+
 import numpy as np
+
 from lib.directories import EMBEDDINGS_DIR
-
-# from EAT
-from dataclasses import dataclass
-
-import torch
-import torch.nn.functional as F
-import fairseq
-import torchaudio
 
 TRIM_DUR = 30 # seconds
 
 if __name__=="__main__":
 
     DEFAULT_MODEL_PATH = "/Users/ege/Projects/OGUZ/fairseq_pretrains/eat-base_epoch30.pt"
-    DEFAULT_AUDIO_DIR = "/Users/ege/Projects/OGUZ/freesound-sound_similarity/FSD50K_demo"
+    DEFAULT_AUDIO_DIR = "/Users/ege/Projects/OGUZ/freesound-sound_similarity/FSD50K_demo copy"
     DEFAULT_OUTPUT_DIR = "/Users/ege/Projects/OGUZ/output"
 
     parser = ArgumentParser(description=__doc__,
@@ -43,7 +37,6 @@ if __name__=="__main__":
 
     # Get the model name from models/model_name.pt
     model_name = os.path.splitext(os.path.basename(args.model_path))[0]
-
     # Load the corresponding model
     if 'CLAP_weights_2023' == model_name:
         print("Setting up Microsoft CLAP model...")
@@ -197,20 +190,25 @@ if __name__=="__main__":
 
         print("Setting up EAT model...")
         import librosa
+        from dataclasses import dataclass
+        import fairseq
+        import torch
+        import torchaudio
 
         checkpoint_dir = args.model_path
         @dataclass
         class UserDirModule:
             user_dir: str
 
+        # Constant Parameters
         norm_mean = -4.268
         norm_std = 4.569
-
-        """ To Do """
+        fs = 100  # "EAT utilize 100Hz fbank features"
+        target_length = 1024
+        embedding_size = 768 # model creates len(768) vectors
 
         model_dir = "./EAT" # change this
         model_path = UserDirModule(model_dir)
-        print("model_path:", model_path)
         print("model_dir:", model_dir)
         fairseq.utils.import_user_module(model_path)
         model, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([checkpoint_dir])
@@ -223,23 +221,13 @@ if __name__=="__main__":
         def extract_embeddings(model, audio_path):
             # Load the audio file
             audio, sr = librosa.load(audio_path, sr=16000)
-
-            def target_length_by_audio_duration(audio,sr):
-                fs = 100 # "EAT utilize 100Hz fbank features"
-                audio_length = int(len(audio) / sr) # duration of the input audio file in seconds
-                feature_length =  audio_length * fs # required length considering the audio file length.
-                print("feature_length", feature_length)
-                if feature_length  <= 512:
-                        target_length = 512
-                else:
-                    target_length = 1024 * (feature_length // 1024 + 1)
-                return(target_length)
-
-            target_length = target_length_by_audio_duration(audio,sr)
+            audio_length = int(len(audio) / sr)  # duration of the input audio file in seconds
+            print(f"Audio Length: {audio_length} seconds")
 
             source = torch.from_numpy(audio).float().to(device='cpu')
+
+            # no need as we already resampled to 16khz with librosa
             # source = torchaudio.functional.resample(source, orig_freq=sr, new_freq=16000).float().to(device='cpu')
-            # no need to use the above line as we have already resampled to 16khz with librosa
 
             source = source - source.mean()
             source = source.unsqueeze(dim=0)
@@ -248,51 +236,64 @@ if __name__=="__main__":
                                                        window_type='hanning', num_mel_bins=128, dither=0.0,
                                                        frame_shift=10).unsqueeze(dim=0)
 
-            n_frames = source.shape[1] # number of time bins
-            print("n_frames:", n_frames, "target length:", target_length)
-            print("source shape=", source.shape)
-            diff = target_length - n_frames
-            print("diff=", diff)
-            if diff > 0:
+            print("Initial Shape (Tbins, Fbins):", source.shape[1:])
+
+            no_of_tbins = source.shape[1]  # number of time bins
+            no_of_split = no_of_tbins // target_length  # integer division
+            remainder = no_of_tbins % target_length
+            chunks = [target_length if i != no_of_split else remainder for i in range(no_of_split + 1)]
+
+            flag = False
+            if remainder > 512 or remainder==0 or no_of_split == 0:  # ignore the remainder audio segment if it is less than 512
+                no_of_split += 1
+                flag = True
+
+            print(f"no_of_splits: {no_of_split}")
+            print(f"{no_of_tbins} = {chunks}")
+
+            feats_sum = np.zeros(embedding_size)  # summation array for the embedding's of each split
+            for i in range(no_of_split):
+                source_sliced = source[:, i * target_length:(i + 1) * target_length, :]
+                diff = target_length - source_sliced.shape[1]  # diff is either zero or >0 for the remainder split
+                print(f"Split #{i+1} :{source_sliced.shape} // {diff} zeros padded")
+
+                #chunk is used only to print how many 1024 splits we have etc.
+                chunks = [target_length for j in range(no_of_split)]
+                if flag:
+                    chunks[-1] = remainder #last element of the chunk (1024) is replaced with the reaminder to see the #tbins
+
                 m = torch.nn.ZeroPad2d((0, 0, 0, diff))
-                source = m(source)
-                print("diff>0, padded. new source shape:", source.shape)
+                source_sliced = m(source_sliced)
+                source_sliced = (source_sliced - norm_mean) / (norm_std * 2)
 
-            elif diff < 0:
-                source = source[:, 0:target_length, :]
-                print("diff<0, sliced. new source shape:", source.shape)
+                with torch.no_grad():
+                    try:
+                        source_sliced = source_sliced.unsqueeze(dim=0)  # btz=1
+                        if granularity == 'frame':
+                            feats = model.extract_features(source, padding_mask=None, mask=False, remove_extra_tokens=True)
+                            feats = feats['x'].squeeze(0).cpu().numpy()
 
-            source = (source - norm_mean) / (norm_std * 2)
-
-            # comment this line to fine-tune an end-to-end model
-            with torch.no_grad():
-                try:
-                    print("dooooo")
-                    source = source.unsqueeze(dim=0)  # btz=1
-                    print("neeee")
-                    if granularity == 'frame':
-                        feats = model.extract_features(source, padding_mask=None, mask=False, remove_extra_tokens=True)
-                        feats = feats['x'].squeeze(0).cpu().numpy()
-
-                    elif granularity == 'utterance':
-                        print("before shape:", print(source.shape))
-                        feats = model.extract_features(source, padding_mask=None, mask=False, remove_extra_tokens=False)
-                        print("SUCCESS with shape",print(source.shape))
-                        feats = feats['x']
-                        feats = feats[:, 0].squeeze(0).cpu().numpy()
-                    else:
-                        raise ValueError("Unknown granularity: {}".format(args.granularity))
-                except:
-                    print("Error in extracting features from {}".format(audio_path))
-                    Exception("Error in extracting features from {}".format(audio_path))
+                        elif granularity == 'utterance':
+                            feats = model.extract_features(source_sliced, padding_mask=None, mask=False,
+                                                           remove_extra_tokens=False)
+                            feats = feats['x']
+                            feats = feats[:, 0].squeeze(0).cpu().numpy()
+                            feats_sum += feats
+                        else:
+                            raise ValueError("Unknown granularity: {}".format(args.granularity))
+                    except Exception as e:
+                        print("Error in extracting features from {}:\n".format(audio_path))
+                        print(e, "\n")
+                        Exception("Error in extracting features from {}".format(audio_path))
 
             # Create the embeddings
-            embeddings = feats
+            feats_ave = feats_sum / no_of_split #take an average of all splits (nothing changes if there is only 1 split)
+            embeddings = feats_ave
 
             # Check if `embeddings` is a NumPy array
             if isinstance(embeddings, np.ndarray):
                 embeddings = embeddings.tolist()
-                # print("Embeddings is a NumPy array, converting to list to make it serializable to json")
+                print("Embeddings is a NumPy array, converting to list to make it serializable to json")
 
             return embeddings
 
@@ -325,7 +326,7 @@ if __name__=="__main__":
     start_time = time.time()
     for i,audio_path in enumerate(audio_paths):
         # Create the output path
-        print("audio_path:", audio_path)
+        print("\naudio_path:", audio_path)
         fname = os.path.splitext(os.path.basename(audio_path))[0]
         output_path = os.path.join(output_dir, f"{fname}.json")
         # Check if the output file already exists
@@ -336,12 +337,14 @@ if __name__=="__main__":
                 # print(f"embeddings returned {embeddings}")
                 print(f"embeddings returned")
 
-
                 with open(output_path, 'w') as outfile:
                     json.dump({'audio_path': audio_path, 'embeddings': embeddings}, outfile, indent=4)
-            except:
-                print(f"Error processing {audio_path}")
+            except Exception as e:
+                # print(f"Error processing {audio_path}")
+                print(f"Error extracting:", e)
                 print("\n")
+        else:
+            print("file exists")
 
         # Print progress
         if (i+1)%1000==0 or i==0 or i+1==len(audio_paths):
